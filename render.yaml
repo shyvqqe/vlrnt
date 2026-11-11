@@ -1,0 +1,33 @@
+# Render Blueprint для отдельного репозитория с папкой bot в корне.
+# Нужен платный Background Worker и постоянный диск для SQLite.
+services:
+  - type: worker
+    name: valorant-loss-bot
+    runtime: python
+    plan: 0.5c-512mb
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    numInstances: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: RIOT_API_KEY
+        sync: false
+      - key: TELEGRAM_OWNER_ID
+        value: "8287059539"
+      - key: RIOT_GAME_NAME
+        value: zev1x
+      - key: RIOT_TAG_LINE
+        value: "436"
+      - key: VAL_REGION
+        value: eu
+      - key: CHECK_INTERVAL_SECONDS
+        value: "180"
+      - key: DB_PATH
+        value: /data/valorant.sqlite3
+    disk:
+      name: valorant-data
+      mountPath: /data
+      sizeGB: 1
