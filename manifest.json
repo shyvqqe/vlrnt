@@ -1,0 +1,57 @@
+{
+  "manifest_version": 1,
+  "type": "WebApp",
+  "meta": {
+    "name": "Valorant Telegram Loss Alerts",
+    "author": "zev1x",
+    "version": "0.1.0",
+    "minimum-overwolf-version": "0.170.0",
+    "description": "Overwolf: отправка результатов матчей Valorant в личный Telegram-бот через Render",
+    "icon": "icons/icon.png",
+    "icon_gray": "icons/icon_gray.png",
+    "window_icon": "icons/window.png",
+    "launcher_icon": "icons/desktop.ico"
+  },
+  "permissions": [
+    "GameInfo"
+  ],
+  "data": {
+    "start_window": "main",
+    "windows": {
+      "main": {
+        "file": "index.html",
+        "desktop_only": true,
+        "native_window": true,
+        "resizable": false,
+        "size": {
+          "width": 600,
+          "height": 610
+        },
+        "min_size": {
+          "width": 600,
+          "height": 610
+        }
+      }
+    },
+    "game_targeting": {
+      "type": "dedicated",
+      "game_ids": [
+        21640
+      ]
+    },
+    "game_events": [
+      21640
+    ],
+    "launch_events": [
+      {
+        "event": "GameLaunch",
+        "event_data": {
+          "game_ids": [
+            21640
+          ]
+        },
+        "start_minimized": true
+      }
+    ]
+  }
+}

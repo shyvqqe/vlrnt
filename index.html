@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Valorant → Telegram</title>
+  <style>
+    :root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; }
+    body { background:#121726; color:#edf1fa; margin:0; padding:22px; }
+    h1 {font-size:23px;margin:0 0 6px} p {color:#a9b6ca;font-size:13px;line-height:1.5}
+    label {display:block;font-weight:600;margin-top:16px;margin-bottom:5px;font-size:13px}
+    input[type=text],input[type=password] {box-sizing:border-box;width:100%;padding:11px;border:1px solid #48546a;
+       border-radius:8px;background:#1e2739;color:white;font-size:13px}
+    button {padding:10px 13px;background:#eb5968;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600}
+    button.secondary {background:#34425a} .buttons {display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}
+    .stats {background:#1d2638;border-radius:8px;padding:10px;margin-top:15px;font-size:13px}
+    pre {white-space:pre-wrap;overflow:auto;font-family:Consolas,monospace;font-size:11px;
+      height:135px;border-radius:8px;background:#0b1120;color:#b9d4db;padding:10px}
+    .note {font-size:11px;color:#a9b6ca}
+  </style>
+</head>
+<body>
+  <h1>Valorant → Telegram</h1>
+  <p>Передаёт результаты законченных матчей на Render. Бот пишет в личку только при проигрыше; победа сбрасывает серию.</p>
+  <label for="endpoint">Адрес Render</label>
+  <input type="text" id="endpoint" placeholder="https://vlrnt.onrender.com" autocomplete="off">
+  <label for="token">BRIDGE_TOKEN (такой же, как на Render)</label>
+  <input type="password" id="token" placeholder="Вставь случайный секрет от 32 символов" autocomplete="off">
+  <p><label style="font-weight:normal;margin:4px 0"><input type="checkbox" id="showToken"> Показать секрет</label></p>
+  <div class="buttons">
+    <button id="save">Сохранить</button>
+    <button class="secondary" id="test">Проверить соединение</button>
+    <button class="secondary" id="flush">Повторить отправку</button>
+  </div>
+  <div class="stats"><strong id="state">Запуск...</strong><br>Матчей в очереди: <b id="queueSize">0</b></div>
+  <label>Журнал работы (без токена)</label>
+  <pre id="logs">Загрузка...</pre>
+  <p class="note">Работает только при запущенном Overwolf на ПК. ACS/RR не обещаются; в канал ничего не отправляется.</p>
+  <script src="collector.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

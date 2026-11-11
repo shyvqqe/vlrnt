@@ -1,134 +1,36 @@
-"""Личный Telegram-бот: автоматически уведомляет только о поражениях VALORANT."""
+"""Telegram-бот принимает результаты Overwolf по HTTPS и пишет ТОЛЬКО владельцу."""
 
 import asyncio
 import contextlib
+import hmac
 import logging
 import os
+import time
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiohttp import web
+from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 from dotenv import load_dotenv
-from aiohttp import web
 
 from db import Database
-from parser import loss_message, parse_match
-from riot_api import RiotClient, RiotApiError
+from match_data import loss_message, validate_match
 
-# При локальном запуске .env лежит рядом с main.py; Render передаст переменные сам.
 load_dotenv(Path(__file__).with_name(".env"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-LOG = logging.getLogger("valorant-bot")
+LOG = logging.getLogger("overwolf-bot")
 
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-RIOT_KEY = os.getenv("RIOT_API_KEY", "").strip()
 OWNER_ID = int(os.getenv("TELEGRAM_OWNER_ID", "8287059539"))
-GAME_NAME = os.getenv("RIOT_GAME_NAME", "zev1x")
-TAG_LINE = os.getenv("RIOT_TAG_LINE", "436")
-REGION = os.getenv("VAL_REGION", "eu").lower()
-INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL_SECONDS", "180")))
+BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 DB_PATH = os.getenv("DB_PATH", "./data/valorant.sqlite3")
+PORT = int(os.getenv("PORT", "10000"))
 
 router = Router()
-
-
-class Monitor:
-    def __init__(self, bot: Bot, db: Database, riot: RiotClient):
-        self.bot = bot
-        self.db = db
-        self.riot = riot
-        self.lock = asyncio.Lock()
-        self.wakeup = asyncio.Event()
-        self.cached_puuid: str | None = None
-
-    async def check_once(self):
-        if self.db.get("owner_id") != OWNER_ID:
-            return  # Пока владелец не нажал /start, никуда не пишем.
-        async with self.lock:
-            puuid = self.cached_puuid
-            if not puuid:
-                puuid = await self.riot.puuid(GAME_NAME, TAG_LINE)
-                self.cached_puuid = puuid
-            history = await self.riot.matchlist(puuid)
-            history = [h for h in history if h.get("matchId")]
-            history.sort(key=lambda h: (int(h.get("gameStartTimeMillis") or 0), h["matchId"]))
-
-            # Первый запуск: фиксируем уже существующий матч, не отправляя историю.
-            if self.db.get("last_match_id") is None:
-                if history:
-                    last = history[-1]
-                    self.db.put("last_match_id", last["matchId"])
-                    self.db.put("last_match_time", int(last.get("gameStartTimeMillis") or 0))
-                else:
-                    # Список пуст, но инициализация завершена: первую будущую игру не пропустим.
-                    self.db.put("last_match_id", "__empty_history__")
-                    self.db.put("last_match_time", 0)
-                self.db.put("loss_streak", 0)
-                LOG.info("Первичный курсор установлен. Старые матчи не отправляем.")
-                await self.deliver_pending()
-                return
-
-            last_time = int(self.db.get("last_match_time", 0))
-            last_id = self.db.get("last_match_id")
-            unseen = [
-                h for h in history
-                if (int(h.get("gameStartTimeMillis") or 0) > last_time or
-                    (int(h.get("gameStartTimeMillis") or 0) == last_time and h["matchId"] != last_id))
-                and not self.db.exists(h["matchId"])
-            ]
-
-            # Детали обрабатываем хронологически, иначе серия проигрышей будет неверной.
-            content = {}
-            if unseen:
-                try:
-                    content = await self.riot.content()
-                except RiotApiError as exc:
-                    LOG.warning("Справочник Riot недоступен: %s", exc)
-            for h in unseen:
-                match_id = h["matchId"]
-                details = await self.riot.match(match_id)
-                result = parse_match(details, puuid, content)
-                streak = int(self.db.get("loss_streak", 0))
-                if result.outcome == "loss":
-                    streak += 1
-                elif result.outcome in {"win", "draw"}:
-                    streak = 0
-                # В режимах без явного победителя сохраняем предыдущую серию.
-                message = loss_message(result, streak) if result.outcome == "loss" else None
-                started = int(h.get("gameStartTimeMillis") or details.get("matchInfo", {}).get("gameStartMillis") or 0)
-                self.db.record(match_id, started, result, message, streak)
-                LOG.info("Матч %s обработан (%s)", match_id, result.outcome)
-            await self.deliver_pending()
-
-    async def deliver_pending(self):
-        # При временной ошибке Telegram сообщения сохраняются в SQLite до следующей попытки.
-        for row in self.db.pending():
-            try:
-                await self.bot.send_message(chat_id=OWNER_ID, text=row["message"])
-            except Exception:
-                LOG.exception("Не удалось отправить уведомление. Повторим позже.")
-                break
-            else:
-                self.db.mark_sent(row["match_id"])
-
-    async def run_forever(self):
-        while True:
-            try:
-                await self.check_once()
-            except (RiotApiError, ValueError, KeyError):
-                LOG.exception("Ошибка обработки Riot API, повтор через %s сек.", INTERVAL)
-            except Exception:
-                LOG.exception("Непредвиденная ошибка, цикл продолжится")
-            try:
-                await asyncio.wait_for(self.wakeup.wait(), timeout=INTERVAL)
-            except asyncio.TimeoutError:
-                pass
-            self.wakeup.clear()
-
-
-monitor: Monitor | None = None
-storage: Database | None = None
+store: Database | None = None
+telegram: Bot | None = None
+send_lock = asyncio.Lock()
 
 
 def is_owner(message: Message) -> bool:
@@ -138,18 +40,43 @@ def is_owner(message: Message) -> bool:
     )
 
 
+async def deliver_pending():
+    """При временном сбое Telegram оставляем сообщения в SQLite для повтора."""
+    assert store is not None and telegram is not None
+    if store.get("owner_id") != OWNER_ID:
+        return
+    async with send_lock:
+        for row in store.pending():
+            try:
+                await telegram.send_message(chat_id=OWNER_ID, text=row["message"])
+            except Exception:
+                LOG.exception("Telegram недоступен, повтор отправки позднее")
+                break
+            store.mark_sent(row["match_id"])
+
+
+async def pending_loop():
+    """Повтор доставки по таймеру; не опрашиваем Riot API."""
+    while True:
+        try:
+            await deliver_pending()
+        except Exception:
+            LOG.exception("Сбой обработки очереди Telegram")
+        await asyncio.sleep(30)
+
+
 @router.message(Command("start"))
 async def start(message: Message):
     if not is_owner(message):
-        # Чужие чаты игнорируем молча: бот предназначен только для владельца.
         return
-    assert storage is not None and monitor is not None
-    storage.put("owner_id", OWNER_ID)
-    monitor.wakeup.set()
+    assert store is not None
+    if store.get("owner_started_at") is None:
+        store.put("owner_started_at", int(time.time() * 1000))
+    store.put("owner_id", OWNER_ID)
     await message.answer(
-        f"Мониторинг {GAME_NAME}#{TAG_LINE} включён. "
-        f"Проверяю матчи каждые {INTERVAL} секунд. "
-        "Пишу сам только о новых поражениях. Старые матчи не отправляю."
+        "Мониторинг Valorant через Overwolf включён. "
+        "Запусти локальное приложение на ПК. "
+        "Только новые поражения будут приходить сюда; канал не используется."
     )
 
 
@@ -157,26 +84,21 @@ async def start(message: Message):
 async def last(message: Message):
     if not is_owner(message):
         return
-    assert storage is not None
-    item = storage.last_loss()
-    await message.answer(item["message"] if item else "Новых проигрышей после запуска ещё нет.")
+    assert store is not None
+    row = store.last_loss()
+    await message.answer(row["message"] if row else "Проигрышей пока нет.")
 
 
 @router.message(Command("stats"))
 async def stats(message: Message):
     if not is_owner(message):
         return
-    assert storage is not None
-    row = storage.stats()
-    if not row["total"]:
-        await message.answer("Статистика появится после новых матчей. Старая история не учитывается.")
-        return
+    assert store is not None
+    s = store.stats()
     await message.answer(
-        "Матчи после начала мониторинга:\n"
-        f"Всего: {row['total']}\n"
-        f"Побед: {row['wins']}\n"
-        f"Поражений: {row['losses']}\n"
-        f"K/D/A: {row['kills']}/{row['deaths']}/{row['assists']}"
+        "Матчи, переданные Overwolf после /start:\n"
+        f"Всего: {s['total']}\nПобед: {s['wins']}\nПоражений: {s['losses']}\n"
+        f"K/D/A (из доступных данных): {s['kills']}/{s['deaths']}/{s['assists']}"
     )
 
 
@@ -184,48 +106,92 @@ async def stats(message: Message):
 async def streak(message: Message):
     if not is_owner(message):
         return
-    assert storage is not None
-    await message.answer(f"Текущая серия поражений: {storage.get('loss_streak', 0)}")
+    assert store is not None
+    await message.answer(f"Текущая серия поражений: {store.get('loss_streak', 0)}")
 
 
-async def start_health_server() -> web.AppRunner:
-    """Открываем HTTP-порт для Render Web Service, не заменяя Telegram polling."""
-    async def health(_request: web.Request) -> web.Response:
-        # Этот адрес сообщает о работе процесса, но не о доступности Riot API.
-        return web.Response(text="OK\n", content_type="text/plain")
+def cors_headers() -> dict:
+    # Для локального Overwolf расширения. Доступ ограничивается BRIDGE_TOKEN,
+    # а не CORS (CORS сам по себе не является авторизацией).
+    return {"Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, X-Bridge-Token",
+            "Cache-Control": "no-store"}
 
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
+
+def authorized(request: web.Request) -> bool:
+    supplied = request.headers.get("X-Bridge-Token", "")
+    return bool(supplied and hmac.compare_digest(supplied, BRIDGE_TOKEN))
+
+
+async def health(_request: web.Request) -> web.Response:
+    return web.Response(text="OK\n")
+
+
+async def options(_request: web.Request) -> web.Response:
+    return web.Response(status=204, headers=cors_headers())
+
+
+async def ping(request: web.Request) -> web.Response:
+    if not authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401, headers=cors_headers())
+    return web.json_response({"status": "ready"}, headers=cors_headers())
+
+
+async def accept_match(request: web.Request) -> web.Response:
+    """Секретный вход для Overwolf: принимает результат, не публикует в канал."""
+    if not authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401, headers=cors_headers())
+    # Не принимаем произвольно большие тела и незнакомые типы данных.
+    if request.content_length is not None and request.content_length > 8192:
+        return web.json_response({"error": "too_large"}, status=413, headers=cors_headers())
     try:
-        # Render ожидает 0.0.0.0 и порт из переменной PORT.
-        port = int(os.getenv("PORT", "10000"))
-        site = web.TCPSite(runner, host="0.0.0.0", port=port)
-        await site.start()
-    except Exception:
-        await runner.cleanup()
-        raise
-    LOG.info("HTTP-проверка Render запущена на 0.0.0.0:%s", port)
-    return runner
+        data = validate_match(await request.json())
+    except (ValueError, TypeError, UnicodeError):
+        return web.json_response({"error": "invalid_match"}, status=400, headers=cors_headers())
+
+    assert store is not None
+    if store.get("owner_id") != OWNER_ID:
+        # До /start НЕ накапливаем старые матчи для будущей рассылки.
+        return web.json_response({"status": "ignored_until_start"}, headers=cors_headers())
+    # При задержке сети не отправляем матчи, сыгранные ещё до первого /start.
+    if data["finished_at"] < int(store.get("owner_started_at", 0)):
+        return web.json_response({"status": "ignored_before_start"}, headers=cors_headers())
+    if store.exists(data["match_id"]):
+        return web.json_response({"status": "duplicate"}, headers=cors_headers())
+    next_streak = int(store.get("loss_streak", 0)) + 1 if data["outcome"] == "loss" else 0
+    text = loss_message(data, next_streak) if data["outcome"] == "loss" else None
+    inserted, streak = store.record(data, text)
+    LOG.info("Матч %s: %s, серия: %d, новый: %s", data["match_id"],
+             data["outcome"], streak, inserted)
+    # Сначала отвечаем быстро; доставка пройдет через цикл каждые <=30 сек.
+    return web.json_response({"status": "saved" if inserted else "duplicate"}, headers=cors_headers())
 
 
 async def main():
-    global monitor, storage
-    if not TOKEN or not RIOT_KEY or TOKEN.startswith("ВСТАВЬ") or RIOT_KEY.startswith("ВСТАВЬ"):
-        raise RuntimeError("Укажи TELEGRAM_TOKEN и одобренный RIOT_API_KEY в .env / Render Environment")
-    storage = Database(DB_PATH)
-    runner = None
+    global store, telegram
+    if not TOKEN or TOKEN.startswith("ВСТАВЬ"):
+        raise RuntimeError("Укажи TELEGRAM_TOKEN в Render Environment")
+    if len(BRIDGE_TOKEN) < 32 or BRIDGE_TOKEN.startswith("ВСТАВЬ"):
+        raise RuntimeError("Задай случайный BRIDGE_TOKEN длиной от 32 символов")
+    store = Database(DB_PATH)
+    app = web.Application(client_max_size=8192)
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_get("/api/ping", ping)
+    app.router.add_post("/api/match", accept_match)
+    app.router.add_route("OPTIONS", "/api/match", options)
+    app.router.add_route("OPTIONS", "/api/ping", options)
+    runner = web.AppRunner(app)
     try:
-        # HTTP-порт нужен Render Web Service; Telegram по-прежнему работает через polling.
-        runner = await start_health_server()
-        dp = Dispatcher()
-        dp.include_router(router)
-        async with Bot(token=TOKEN) as bot, RiotClient(RIOT_KEY, REGION) as riot:
-            # Фоновый цикл запускается независимо от команд пользователя.
-            monitor = Monitor(bot, storage, riot)
-            task = asyncio.create_task(monitor.run_forever())
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", PORT).start()
+        LOG.info("HTTP-порт %d активен, Overwolf endpoint /api/match", PORT)
+        async with Bot(token=TOKEN) as bot:
+            telegram = bot
+            dp = Dispatcher()
+            dp.include_router(router)
+            task = asyncio.create_task(pending_loop())
             try:
                 await dp.start_polling(bot, allowed_updates=["message"])
             finally:
@@ -233,9 +199,8 @@ async def main():
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
     finally:
-        if runner is not None:
-            await runner.cleanup()
-        storage.close()
+        await runner.cleanup()
+        store.close()
 
 
 if __name__ == "__main__":
